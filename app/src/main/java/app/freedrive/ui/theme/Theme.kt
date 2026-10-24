@@ -1,13 +1,17 @@
 package app.freedrive.ui.theme
 
 import android.content.Context
+import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -35,7 +39,19 @@ class ThemeStore(context: Context) {
         _mode.value = mode
     }
 
-    private companion object { const val KEY = "theme_mode" }
+    /** Material You: take the palette from the wallpaper. Android 12+ only. */
+    private val _dynamic = MutableStateFlow(prefs.getBoolean(KEY_DYNAMIC, false))
+    val dynamic: StateFlow<Boolean> = _dynamic
+
+    fun setDynamic(on: Boolean) {
+        prefs.edit().putBoolean(KEY_DYNAMIC, on).apply()
+        _dynamic.value = on
+    }
+
+    private companion object {
+        const val KEY = "theme_mode"
+        const val KEY_DYNAMIC = "dynamic_color"
+    }
 }
 
 val LocalThemeStore = staticCompositionLocalOf<ThemeStore> { error("ThemeStore not provided") }
@@ -102,14 +118,19 @@ private val Dark = darkColorScheme(
 )
 
 @Composable
-fun FreeDriveTheme(mode: ThemeMode, content: @Composable () -> Unit) {
+fun FreeDriveTheme(mode: ThemeMode, dynamic: Boolean = false, content: @Composable () -> Unit) {
     val dark = when (mode) {
         ThemeMode.SYSTEM -> isSystemInDarkTheme()
         ThemeMode.LIGHT -> false
         ThemeMode.DARK -> true
     }
-    MaterialTheme(
-        colorScheme = if (dark) Dark else Light,
-        content = content,
-    )
+    val context = LocalContext.current
+    val scheme = when {
+        dynamic && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
+            if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+
+        dark -> Dark
+        else -> Light
+    }
+    MaterialTheme(colorScheme = scheme, content = content)
 }

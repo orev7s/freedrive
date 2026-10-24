@@ -34,7 +34,18 @@ The same idea as pooling free LLM APIs behind one endpoint, applied to bytes ins
 - **Pick where it goes.** A provider selector above the grid, default `Any available` (largest free
   space wins, with a per-provider safety reserve). Choose one provider and it either takes the file
   or tells you exactly why it can't. "Remember" is a checkbox, off by default.
-- **Sharing.** A link a friend can open in any browser, with an expiry you choose.
+- **Sharing.** A link a friend can open in any browser, with an expiry you choose, plus an
+  optional password on pCloud and Koofr links.
+- **Search, sort, list or grid.** Search spans every folder and every provider; the sort order
+  (newest, name, largest) and the layout are view state, so switching is instant.
+- **Multi-select.** Long-press any file to start selecting; delete a batch in one go.
+- **Save to device.** Any image can be written into `Pictures/FreeDrive` through MediaStore.
+- **Move between providers.** Re-upload a file to another account, delete the old copy only after
+  the new one is confirmed, and repoint the index.
+- **Duplicate detection.** Identical bytes are recognised by SHA-256 and skipped instead of
+  uploaded twice.
+- **A link log.** Every URL handed out is recorded, so it can be found and forgotten later.
+- **Per-provider usage bars** in Settings, plus Material You wallpaper colours on Android 12+.
 - **Light, dark, or follow the system.** Material 3 throughout.
 
 ## Providers
@@ -78,7 +89,8 @@ Three routes, and the app picks the best one the file's provider allows:
 
 - **Native link** — pCloud and Koofr issue the link themselves (`expire`, `maxdownloads`,
   `linkpassword`, short URLs). The friend downloads straight from the provider's CDN, and the link
-  keeps working with your phone off.
+  keeps working with your phone off. Koofr is configured as WebDAV for storage, but its links API
+  is used for sharing — which also makes it a valid mirror target.
 - **Signed link** — B2, e2, R2 and Oracle accept a presigned `GET`. The signature is scoped to one
   object for one window, and `7 days` is the hard ceiling because that is what SigV4 allows.
 - **Wi-Fi handoff** — optional, off by default. The phone serves the file to another device on the

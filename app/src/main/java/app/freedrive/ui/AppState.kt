@@ -13,9 +13,12 @@ import app.freedrive.data.Lifetime
 import app.freedrive.data.ProviderSpec
 import app.freedrive.data.ShareLink
 import app.freedrive.data.TempHost
+import app.freedrive.data.adapters.Json
+import app.freedrive.data.adapters.KoofrLinks
 import app.freedrive.data.adapters.readable
 import app.freedrive.data.db.EntryEntity
 import app.freedrive.data.db.ProviderEntity
+import app.freedrive.data.db.ShareEntity
 import app.freedrive.data.db.UploadEntity
 import app.freedrive.data.db.UploadState
 import app.freedrive.ui.theme.ThemeMode
@@ -28,6 +31,13 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 
 enum class Tab { FILES, PROVIDERS, SETTINGS }
+
+/** How the grid is ordered. Pure view state: nothing here touches the index. */
+enum class SortBy(val label: String) {
+    NEWEST("Newest"),
+    NAME("Name"),
+    LARGEST("Largest"),
+}
 
 sealed interface Route {
     data object Root : Route
@@ -74,6 +84,32 @@ class AppState(
         private set
     var live by mutableStateOf<Map<String, Long>>(emptyMap())
         private set
+
+    // ---- searching and view controls
+
+    var searchOpen by mutableStateOf(false)
+        private set
+    var query by mutableStateOf("")
+        private set
+    var searchResults by mutableStateOf<List<EntryEntity>>(emptyList())
+        private set
+    var searching by mutableStateOf(false)
+        private set
+    var sort by mutableStateOf(SortBy.NEWEST)
+        private set
+    var listMode by mutableStateOf(false)
+        private set
+
+    /** Files ticked for a bulk delete. Empty means the grid is in its normal mode. */
+    var selection by mutableStateOf<Set<String>>(emptySet())
+        private set
+
+    /** Links handed out, newest first. Shown in Settings so they can be killed. */
+    var shares by mutableStateOf<List<ShareEntity>>(emptyList())
+        private set
+
+    /** Optional password for the next pCloud or Koofr link. Empty means none. */
+    var linkPassword by mutableStateOf("")
 
     var previewId by mutableStateOf<String?>(null)
         private set
@@ -158,6 +194,7 @@ class AppState(
             snapshotFlow { folderId }.collect { path = repo.path(it) }
         }
         scope.launch { repo.uploads().collect { uploads = it } }
+        scope.launch { repo.shares().collect { shares = it } }
         scope.launch { repo.live.collect { live = it } }
         scope.launch { repo.lan.collect { lanLink = it } }
         scope.launch {
@@ -331,6 +368,80 @@ class AppState(
         scope.launch { runCatching { repo.clearFinishedUploads() }.onFailure { error = it.readable() } }
     }
 
+    // ------------------------------------------------------------ search, sort, selection
+
+    fun updateQuery(value: String) {
+        query = value
+        if (value.isBlank()) {
+            searchResults = emptyList()
+            searching = false
+            return
+        }
+        searching = true
+        scope.launch {
+            val results = runCatching { repo.search(value) }.getOrDefault(emptyList())
+            if (query == value) {
+                searchResults = results
+                searching = false
+            }
+        }
+    }
+
+    fun openSearch() {
+        searchOpen = true
+    }
+
+    fun closeSearch() {
+        searchOpen = false
+        query = ""
+        searchResults = emptyList()
+        searching = false
+    }
+
+    fun setDynamicColor(on: Boolean) = theme.setDynamic(on)
+
+    fun applySort(next: SortBy) {
+        sort = next
+    }
+
+    fun toggleListMode() {
+        listMode = !listMode
+    }
+
+    fun toggleSelection(id: String) {
+        selection = if (id in selection) selection - id else selection + id
+    }
+
+    fun clearSelection() {
+        selection = emptySet()
+    }
+
+    fun deleteSelected() {
+        val ids = selection
+        selection = emptySet()
+        scope.launch {
+            ids.forEach { id -> runCatching { repo.delete(id) }.onFailure { error = it.readable() } }
+        }
+    }
+
+    fun saveToDevice(entry: EntryEntity) {
+        scope.launch {
+            runCatching { repo.exportToPictures(entry.id) }
+                .onSuccess { error = "Saved \"$it\" to Pictures/FreeDrive" }
+                .onFailure { error = it.readable() }
+        }
+    }
+
+    fun moveTo(entry: EntryEntity, target: ProviderEntity) {
+        scope.launch {
+            runCatching { repo.moveTo(entry.id, target.id) }.onFailure { error = it.readable() }
+        }
+    }
+
+    fun revokeShare(id: String) {
+        scope.launch { runCatching { repo.revokeShare(id) }.onFailure { error = it.readable() } }
+    }
+
     // ------------------------------------------------------------ sharing
 
     /**
@@ -342,6 +453,7 @@ class AppState(
         shareFor = entry
         shareLink = null
         shareError = null
+        linkPassword = ""
         shareLifetime = entry.expiresAt
             ?.let { Lifetime.nearest(it - System.currentTimeMillis()) }
             ?: Lifetime.ONE_DAY
@@ -371,8 +483,13 @@ class AppState(
             shareLink = null
             shareError = null
             val seconds = if (lifetime > 0L) lifetime / 1000L else Lifetime.MAX_LINK_SECONDS
-            runCatching { repo.armAndShare(entry.id, lifetime.takeIf { it > 0L }, seconds) }
-                .onSuccess { shareLink = it }
+            runCatching {
+                repo.armAndShare(entry.id, lifetime.takeIf { it > 0L }, seconds, linkPassword.takeIf { it.isNotBlank() })
+            }
+                .onSuccess { link ->
+                    shareLink = link
+                    repo.rememberShare(entry, link)
+                }
                 .onFailure { shareError = it.readable() }
             shareBusy = false
         }
@@ -380,22 +497,42 @@ class AppState(
 
     // ------------------------------------------------------------ when the provider cannot link
 
-    /** True for pCloud and the S3 family; false for Telegram and plain WebDAV. */
+    /**
+     * Whether a provider can mint a link. Koofr is configured as WebDAV but has a links API,
+     * so asking only about the adapter kind got it wrong: it was refused a link and never
+     * appeared as a mirror target.
+     */
+    fun canLink(provider: ProviderEntity): Boolean {
+        val kind = specOf(provider)?.kind ?: return false
+        if (kind == AdapterKind.PCLOUD || kind == AdapterKind.S3) return true
+        if (kind != AdapterKind.WEBDAV) return false
+        val base = runCatching { Json.decode(provider.configJson)["baseUrl"].orEmpty() }.getOrDefault("")
+        return KoofrLinks.applies(base)
+    }
+
     val shareProviderCanLink: Boolean
         get() {
             val provider = shareFor?.providerId
                 ?.let { id -> providers.firstOrNull { it.id == id } }
                 ?: return true
-            val kind = specOf(provider)?.kind ?: return true
-            return kind == AdapterKind.PCLOUD || kind == AdapterKind.S3
+            return canLink(provider)
+        }
+
+    /** pCloud and Koofr take a password on a link; a signed URL cannot. */
+    val shareSupportsPassword: Boolean
+        get() {
+            val provider = shareFor?.providerId
+                ?.let { id -> providers.firstOrNull { it.id == id } }
+                ?: return false
+            val kind = specOf(provider)?.kind ?: return false
+            return kind == AdapterKind.PCLOUD ||
+                (kind == AdapterKind.WEBDAV && canLink(provider))
         }
 
     /** Other providers of yours that can actually mint a link, for a mirror to land on. */
     val shareTargets: List<ProviderEntity>
         get() = providers.filter { p ->
-            p.id != shareFor?.providerId &&
-                p.status == "OK" &&
-                (specOf(p)?.kind == AdapterKind.PCLOUD || specOf(p)?.kind == AdapterKind.S3)
+            p.id != shareFor?.providerId && p.status == "OK" && canLink(p)
         }
 
     /**
@@ -411,7 +548,10 @@ class AppState(
             shareLink = null
             shareError = null
             runCatching { repo.shareViaTemp(entry.id, host) }
-                .onSuccess { shareLink = it }
+                .onSuccess { link ->
+                    shareLink = link
+                    repo.rememberShare(entry, link)
+                }
                 .onFailure { shareError = it.readable() }
             shareBusy = false
         }
@@ -428,7 +568,10 @@ class AppState(
             shareLink = null
             shareError = null
             runCatching { repo.shareViaMirror(entry.id, target.id, seconds) }
-                .onSuccess { shareLink = it }
+                .onSuccess { link ->
+                    shareLink = link
+                    repo.rememberShare(entry, link)
+                }
                 .onFailure { shareError = it.readable() }
             shareBusy = false
         }

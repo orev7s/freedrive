@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.Folder
@@ -175,6 +176,9 @@ private fun AppBar(state: AppState) {
         },
         actions = {
             if (state.route == Route.Root && state.tab == Tab.FILES) {
+                IconButton(onClick = state::openSearch) {
+                    Icon(Icons.Filled.Search, contentDescription = "Search")
+                }
                 IconButton(onClick = { state.newFolderOpen = true }) {
                     Icon(Icons.Filled.CreateNewFolder, contentDescription = "New folder")
                 }

@@ -100,7 +100,27 @@ object UploadState {
     const val RUNNING = "RUNNING"
     const val DONE = "DONE"
     const val FAILED = "FAILED"
+
+    /** Identical bytes are already in the drive; nothing was uploaded. */
+    const val SKIPPED = "SKIPPED"
 }
+
+/**
+ * One link that was handed out. Kept so a URL can be found and killed later instead of being
+ * remembered only by whoever received it. The URL itself is not a secret worth encrypting —
+ * it is a capability that expires — but it is the only record that it exists.
+ */
+@Entity(tableName = "shares", indices = [Index("entryId")])
+data class ShareEntity(
+    @PrimaryKey val id: String,
+    val entryId: String,
+    val entryName: String,
+    val providerName: String?,
+    val kind: String,
+    val url: String,
+    val createdAt: Long,
+    val diesAt: Long?,
+)
 
 @Dao
 interface FreeDriveDao {
@@ -217,13 +237,33 @@ interface FreeDriveDao {
     @Query("DELETE FROM uploads WHERE id = :id")
     suspend fun deleteUpload(id: String)
 
-    @Query("DELETE FROM uploads WHERE state IN ('DONE', 'FAILED')")
+    @Query("DELETE FROM uploads WHERE state IN ('DONE', 'FAILED', 'SKIPPED')")
     suspend fun clearFinishedUploads()
+
+    // ---- search, duplicates, links
+
+    @Query("SELECT * FROM entries WHERE isFolder = 0 AND name LIKE '%' || :q || '%' ORDER BY createdAt DESC LIMIT 200")
+    suspend fun searchEntries(q: String): List<EntryEntity>
+
+    @Query("SELECT * FROM entries WHERE sha256 = :hash LIMIT 1")
+    suspend fun entryBySha(hash: String): EntryEntity?
+
+    @Query("SELECT * FROM shares ORDER BY createdAt DESC")
+    fun shares(): Flow<List<ShareEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertShare(s: ShareEntity)
+
+    @Query("DELETE FROM shares WHERE id = :id")
+    suspend fun deleteShare(id: String)
+
+    @Query("DELETE FROM shares WHERE entryId = :entryId")
+    suspend fun deleteSharesFor(entryId: String)
 }
 
 @Database(
-    entities = [ProviderEntity::class, EntryEntity::class, JournalEntity::class, UploadEntity::class],
-    version = 4,
+    entities = [ProviderEntity::class, EntryEntity::class, JournalEntity::class, UploadEntity::class, ShareEntity::class],
+    version = 5,
     exportSchema = false,
 )
 abstract class FreeDriveDb : RoomDatabase() {
@@ -247,9 +287,27 @@ abstract class FreeDriveDb : RoomDatabase() {
             }
         }
 
+        /** 0.5 added the share log, so links can be found and revoked later. */
+        private val V4_TO_V5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS shares (" +
+                        "id TEXT NOT NULL PRIMARY KEY, " +
+                        "entryId TEXT NOT NULL, " +
+                        "entryName TEXT NOT NULL, " +
+                        "providerName TEXT, " +
+                        "kind TEXT NOT NULL, " +
+                        "url TEXT NOT NULL, " +
+                        "createdAt INTEGER NOT NULL, " +
+                        "diesAt INTEGER)",
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_shares_entryId ON shares(entryId)")
+            }
+        }
+
         fun build(context: Context): FreeDriveDb =
             Room.databaseBuilder(context, FreeDriveDb::class.java, "freedrive.db")
-                .addMigrations(V2_TO_V3, V3_TO_V4)
+                .addMigrations(V2_TO_V3, V3_TO_V4, V4_TO_V5)
                 .fallbackToDestructiveMigration()
                 .build()
     }

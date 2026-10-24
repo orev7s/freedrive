@@ -13,10 +13,17 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.IosShare
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -50,6 +57,7 @@ fun PreviewOverlay(state: AppState, entry: EntryEntity, onClose: () -> Unit) {
     var file by remember(entry.id) { mutableStateOf<File?>(null) }
     var failure by remember(entry.id) { mutableStateOf<String?>(null) }
     var now by remember(entry.id) { mutableStateOf(System.currentTimeMillis()) }
+    var menu by remember(entry.id) { mutableStateOf(false) }
 
     LaunchedEffect(entry.id, entry.expiresAt) {
         while (entry.expiresAt != null) {
@@ -122,12 +130,42 @@ fun PreviewOverlay(state: AppState, entry: EntryEntity, onClose: () -> Unit) {
                             tint = Color.White,
                         )
                     }
-                    IconButton(onClick = { state.confirmDelete = entry }) {
-                        Icon(
-                            Icons.Outlined.DeleteOutline,
-                            contentDescription = "Delete",
-                            tint = Color.White,
-                        )
+                    Box {
+                        IconButton(onClick = { menu = true }) {
+                            Icon(
+                                Icons.Filled.MoreVert,
+                                contentDescription = "More",
+                                tint = Color.White,
+                            )
+                        }
+                        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            DropdownMenuItem(
+                                text = { Text("Save to device") },
+                                onClick = {
+                                    menu = false
+                                    state.saveToDevice(entry)
+                                },
+                            )
+                            state.providers
+                                .filter { it.id != entry.providerId && it.status == "OK" }
+                                .forEach { target ->
+                                    DropdownMenuItem(
+                                        text = { Text("Move to ${target.label}") },
+                                        onClick = {
+                                            menu = false
+                                            state.moveTo(entry, target)
+                                        },
+                                    )
+                                }
+                            HorizontalDivider()
+                            DropdownMenuItem(
+                                text = { Text("Delete") },
+                                onClick = {
+                                    menu = false
+                                    state.confirmDelete = entry
+                                },
+                            )
+                        }
                     }
                 }
                 Text(

@@ -109,6 +109,19 @@ fun ShareSheet(state: AppState, entry: EntryEntity, onDismiss: () -> Unit) {
                 modifier = Modifier.padding(top = 6.dp),
             )
 
+            // Only pCloud and Koofr accept a password on a link; the rest have no such knob.
+            if (state.shareSupportsPassword) {
+                OutlinedTextField(
+                    value = state.linkPassword,
+                    onValueChange = { state.linkPassword = it },
+                    label = { Text("Password (optional)") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 16.dp),
+                )
+            }
+
             Spacer(Modifier.height(20.dp))
 
             val link = state.shareLink

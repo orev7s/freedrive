@@ -26,8 +26,9 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val mode by theme.mode.collectAsStateWithLifecycle()
+            val dynamic by theme.dynamic.collectAsStateWithLifecycle()
 
-            FreeDriveTheme(mode) {
+            FreeDriveTheme(mode, dynamic) {
                 val dark = MaterialTheme.colorScheme.background.luminance() < 0.5f
                 val view = LocalView.current
 

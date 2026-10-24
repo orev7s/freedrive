@@ -39,7 +39,9 @@ import app.freedrive.data.db.UploadState
 @Composable
 fun QueueSheet(state: AppState, onDismiss: () -> Unit) {
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val finished = state.uploads.any { it.state == UploadState.DONE || it.state == UploadState.FAILED }
+    val finished = state.uploads.any {
+        it.state == UploadState.DONE || it.state == UploadState.FAILED || it.state == UploadState.SKIPPED
+    }
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet) {
         Column(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
@@ -131,6 +133,14 @@ private fun UploadRow(state: AppState, upload: UploadEntity) {
                 text = upload.providerName?.let { "Stored on $it" } ?: "Stored",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.primary,
+            )
+
+            UploadState.SKIPPED -> Text(
+                text = upload.error ?: "Already in the drive",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
             )
 
             else -> Column {

@@ -1,13 +1,16 @@
 package app.freedrive.data
 
+import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import app.freedrive.data.adapters.AdapterException
 import app.freedrive.data.adapters.Adapters
 import app.freedrive.data.adapters.Json
+import app.freedrive.data.adapters.KoofrLinks
 import app.freedrive.data.adapters.PCloudAdapter
 import app.freedrive.data.adapters.StorageAdapter
 import app.freedrive.data.adapters.WebDavAdapter
@@ -17,6 +20,7 @@ import app.freedrive.data.db.EntryEntity
 import app.freedrive.data.db.FreeDriveDb
 import app.freedrive.data.db.JournalEntity
 import app.freedrive.data.db.ProviderEntity
+import app.freedrive.data.db.ShareEntity
 import app.freedrive.data.db.ProviderStatus
 import app.freedrive.data.db.UploadEntity
 import app.freedrive.data.db.UploadState
@@ -316,6 +320,21 @@ class FreeDriveRepo(private val context: Context, db: FreeDriveDb) {
             if (u.size != bytes.size.toLong()) dao.upsertUpload(u.copy(size = bytes.size.toLong()))
 
             val mime = u.mime.ifBlank { "image/jpeg" }
+            val hash = sha256(bytes)
+
+            // Same bytes, already indexed: stop here rather than spend bandwidth on a second copy.
+            val known = dao.entryBySha(hash)
+            if (known != null) {
+                _live.update { it - u.id }
+                dao.setUploadState(
+                    u.id,
+                    UploadState.SKIPPED,
+                    "Already in the drive as \"${known.name}\" on ${known.providerName ?: "a provider"}",
+                )
+                dao.setJournal(seq, "done")
+                return
+            }
+
             val provider = pickProvider(bytes.size.toLong(), u.targetProviderId)
             dao.setUploadProgress(u.id, 0L, provider.label)
 
@@ -349,7 +368,7 @@ class FreeDriveRepo(private val context: Context, db: FreeDriveDb) {
                 providerName = provider.label,
                 remoteKey = remoteKey,
                 thumbPath = thumb?.absolutePath,
-                sha256 = sha256(bytes),
+                sha256 = hash,
                 createdAt = now,
                 // The clock starts when the bytes have landed, not when the picker closed.
                 expiresAt = u.lifetimeMs?.takeIf { it > 0 }?.let { now + it },
@@ -457,13 +476,17 @@ class FreeDriveRepo(private val context: Context, db: FreeDriveDb) {
      * file the sweep is in the middle of deleting. Callers use this instead of the two calls
      * above; the pair is one decision, and it should not be possible to make half of it.
      */
-    suspend fun armAndShare(entryId: String, lifetimeMs: Long?, windowSeconds: Long): ShareLink =
-        withContext(Dispatchers.IO) {
-            shareLock.withLock {
-                setExpiry(entryId, lifetimeMs)
-                shareLink(entryId, windowSeconds)
-            }
+    suspend fun armAndShare(
+        entryId: String,
+        lifetimeMs: Long?,
+        windowSeconds: Long,
+        passwordForLink: String? = null,
+    ): ShareLink = withContext(Dispatchers.IO) {
+        shareLock.withLock {
+            setExpiry(entryId, lifetimeMs)
+            shareLink(entryId, windowSeconds, passwordForLink)
         }
+    }
 
     /** Re-arms one file. Null or zero clears the deadline and lets it stay. */
     suspend fun setExpiry(entryId: String, lifetimeMs: Long?) = withContext(Dispatchers.IO) {
@@ -485,16 +508,45 @@ class FreeDriveRepo(private val context: Context, db: FreeDriveDb) {
      * one window; Telegram and plain WebDAV get a refusal with the reason and the alternative.
      * Nothing here invents a link that would not actually open.
      */
-    suspend fun shareLink(entryId: String, windowSeconds: Long): ShareLink = withContext(Dispatchers.IO) {
+    suspend fun shareLink(
+        entryId: String,
+        windowSeconds: Long,
+        passwordForLink: String? = null,
+    ): ShareLink = withContext(Dispatchers.IO) {
         val entry = dao.entry(entryId) ?: throw AdapterException("That file is no longer indexed")
         if (entry.isFolder) throw AdapterException("A folder has no link. Open it and share an image.")
         val remoteKey = entry.remoteKey ?: throw AdapterException("No remote key recorded for this file")
         val p = entry.providerId?.let { dao.provider(it) }
             ?: throw AdapterException("That provider was removed")
         val spec = Catalog.byId(p.specId) ?: throw AdapterException("Unknown provider")
-        val adapter = Adapters.build(spec, Json.decode(p.configJson), Json.decode(p.secretJson))
+        val cfg = Json.decode(p.configJson)
+        val sec = Json.decode(p.secretJson)
+        val adapter = Adapters.build(spec, cfg, sec)
         val seconds = windowSeconds.coerceIn(1L, Lifetime.MAX_LINK_SECONDS)
         val now = System.currentTimeMillis()
+
+        // Koofr is configured as WebDAV but has a links API beside it. Without this branch a
+        // Koofr account was refused a link and could not be used as a mirror target — the bug.
+        if (spec.kind == AdapterKind.WEBDAV && KoofrLinks.applies(cfg["baseUrl"].orEmpty())) {
+            val url = KoofrLinks.create(
+                baseUrl = cfg["baseUrl"].orEmpty(),
+                username = cfg["username"].orEmpty(),
+                password = sec["password"] ?: cfg["password"].orEmpty(),
+                path = remoteKey,
+                passwordForLink = passwordForLink,
+                expiresAtSeconds = (now + seconds * 1000L) / 1000L,
+            )
+            return@withContext ShareLink(
+                url = url,
+                kind = ShareKind.NATIVE,
+                diesAt = now + seconds * 1000L,
+                note = if (passwordForLink.isNullOrBlank()) {
+                    "Koofr serves this link itself, so this phone can be off. Deleting the image ends it."
+                } else {
+                    "Koofr serves this link itself. It asks for the password you set before downloading."
+                },
+            )
+        }
 
         when (adapter) {
             is PCloudAdapter -> {
@@ -775,6 +827,87 @@ class FreeDriveRepo(private val context: Context, db: FreeDriveDb) {
     }
 
     /** 512px thumbnail so the grid never decodes a 12 MP original. */
+    // ------------------------------------------------------------ moving, saving, links
+
+    /**
+     * Copies one file to another provider, deletes the old copy only after the new one is
+     * confirmed written, then repoints the index row. The bytes are briefly on two providers,
+     * which is the price of never having a window where they are on neither.
+     */
+    suspend fun moveTo(entryId: String, targetProviderId: String) = withContext(Dispatchers.IO) {
+        val entry = dao.entry(entryId) ?: throw AdapterException("That file is no longer indexed")
+        if (entry.isFolder) throw AdapterException("Folders have no bytes to move.")
+        val source = entry.providerId?.let { dao.provider(it) }
+            ?: throw AdapterException("That file has no provider recorded")
+        if (source.id == targetProviderId) throw AdapterException("It is already on ${source.label}.")
+        val target = dao.provider(targetProviderId) ?: throw AdapterException("That provider was removed")
+        if (target.status != ProviderStatus.OK.name) throw AdapterException("${target.label} is not verified.")
+        val sourceSpec = Catalog.byId(source.specId) ?: throw AdapterException("Unknown provider")
+        val targetSpec = Catalog.byId(target.specId) ?: throw AdapterException("Unknown provider")
+        val remoteKey = entry.remoteKey ?: throw AdapterException("No remote key recorded for this file")
+
+        val sourceAdapter = Adapters.build(sourceSpec, Json.decode(source.configJson), Json.decode(source.secretJson))
+        val targetAdapter = Adapters.build(targetSpec, Json.decode(target.configJson), Json.decode(target.secretJson))
+
+        val bytes = sourceAdapter.get(remoteKey)
+        val newKey = targetAdapter.put(entry.name, bytes, entry.mime ?: "image/jpeg")
+        runCatching { sourceAdapter.delete(remoteKey) }
+
+        dao.upsertEntry(entry.copy(providerId = target.id, providerName = target.label, remoteKey = newKey))
+        dao.addUsed(target.id, bytes.size.toLong())
+        dao.addUsed(source.id, -bytes.size.toLong())
+    }
+
+    /** Writes a copy into Pictures/FreeDrive through MediaStore. Returns the display name. */
+    suspend fun exportToPictures(entryId: String): String = withContext(Dispatchers.IO) {
+        val entry = dao.entry(entryId) ?: throw AdapterException("That file is no longer indexed")
+        if (entry.isFolder) throw AdapterException("A folder cannot be saved as an image.")
+        val bytes = originalFile(entryId).readBytes()
+
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, entry.name)
+            put(MediaStore.Images.Media.MIME_TYPE, entry.mime ?: "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FreeDrive")
+        }
+        val resolver = context.contentResolver
+        val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: throw AdapterException("Android refused to create the file in Pictures.")
+        resolver.openOutputStream(uri)?.use { it.write(bytes) }
+            ?: throw AdapterException("Android refused to open the new file for writing.")
+        entry.name
+    }
+
+    /** One row per link handed out, so a URL can be found and killed later. */
+    suspend fun rememberShare(entry: EntryEntity, link: ShareLink) = withContext(Dispatchers.IO) {
+        dao.upsertShare(
+            ShareEntity(
+                id = newId(),
+                entryId = entry.id,
+                entryName = entry.name,
+                providerName = entry.providerName,
+                kind = link.kind.name,
+                url = link.url,
+                createdAt = System.currentTimeMillis(),
+                diesAt = link.diesAt,
+            ),
+        )
+    }
+
+    fun shares(): Flow<List<ShareEntity>> = dao.shares()
+
+    suspend fun search(q: String): List<EntryEntity> = withContext(Dispatchers.IO) {
+        val clean = q.trim()
+        if (clean.isEmpty()) emptyList() else dao.searchEntries(clean)
+    }
+
+    /**
+     * Forgets a link. A signed URL cannot be revoked at the provider — the only way to end one
+     * early is to delete the file — so this drops the record and leaves the expiry alone.
+     */
+    suspend fun revokeShare(id: String) = withContext(Dispatchers.IO) {
+        dao.deleteShare(id)
+    }
+
     private fun writeThumb(id: String, bytes: ByteArray): File? = runCatching {
         val probe = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, probe)

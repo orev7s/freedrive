@@ -50,6 +50,23 @@ import androidx.compose.ui.unit.dp
 import app.freedrive.data.db.EntryEntity
 import coil.compose.AsyncImage
 import java.io.File
+import androidx.compose.foundation.border
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.ViewList
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.ui.graphics.Color
 
 /**
  * The folder you are in. Folders are rows, images are a plain three-up grid with no
@@ -59,11 +76,153 @@ import java.io.File
 @Composable
 fun FilesContent(state: AppState, onPick: () -> Unit) {
     Column(Modifier.fillMaxSize()) {
-        TargetBar(state)
-        if (state.items.isEmpty()) {
-            EmptyFolder(state, onPick)
-        } else {
-            FileGrid(state)
+        if (state.searchOpen) SearchField(state) else {
+            TargetBar(state)
+            ViewBar(state)
+        }
+        if (state.selection.isNotEmpty()) SelectionBar(state)
+
+        when {
+            state.searchOpen -> SearchResults(state)
+            state.items.isEmpty() -> EmptyFolder(state, onPick)
+            state.listMode -> FileList(state)
+            else -> FileGrid(state)
+        }
+    }
+}
+
+/** Sort order is view state only — the index is untouched, so switching is instant. */
+private fun arrange(list: List<EntryEntity>, sort: SortBy): List<EntryEntity> = when (sort) {
+    SortBy.NEWEST -> list.sortedWith(compareByDescending<EntryEntity> { it.isFolder }.thenByDescending { it.createdAt })
+    SortBy.NAME -> list.sortedWith(
+        compareByDescending<EntryEntity> { it.isFolder }.thenBy(String.CASE_INSENSITIVE_ORDER) { it.name },
+    )
+    SortBy.LARGEST -> list.sortedWith(compareByDescending<EntryEntity> { it.isFolder }.thenByDescending { it.size })
+}
+
+@Composable
+private fun SearchField(state: AppState) {
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+
+    OutlinedTextField(
+        value = state.query,
+        onValueChange = state::updateQuery,
+        placeholder = { Text("Search images") },
+        singleLine = true,
+        leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null, modifier = Modifier.size(18.dp)) },
+        trailingIcon = {
+            IconButton(onClick = state::closeSearch) {
+                Icon(Icons.Filled.Close, contentDescription = "Close search", modifier = Modifier.size(18.dp))
+            }
+        },
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+            .focusRequester(focus),
+    )
+}
+
+@Composable
+private fun ViewBar(state: AppState) {
+    var sortOpen by remember { mutableStateOf(false) }
+
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box {
+            TextButton(onClick = { sortOpen = true }, contentPadding = PaddingValues(horizontal = 6.dp)) {
+                Text(state.sort.label, style = MaterialTheme.typography.labelMedium)
+                Icon(Icons.Filled.ArrowDropDown, contentDescription = null, modifier = Modifier.size(16.dp))
+            }
+            DropdownMenu(expanded = sortOpen, onDismissRequest = { sortOpen = false }) {
+                SortBy.entries.forEach { option ->
+                    DropdownMenuItem(
+                        text = { Text(option.label) },
+                        onClick = {
+                            sortOpen = false
+                            state.applySort(option)
+                        },
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.weight(1f))
+        IconButton(onClick = state::toggleListMode) {
+            Icon(
+                if (state.listMode) Icons.Filled.GridView else Icons.Filled.ViewList,
+                contentDescription = if (state.listMode) "Grid view" else "List view",
+                modifier = Modifier.size(20.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun SelectionBar(state: AppState) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "${state.selection.size} selected",
+            style = MaterialTheme.typography.labelLarge,
+        )
+        Spacer(Modifier.weight(1f))
+        TextButton(onClick = state::clearSelection) { Text("Cancel") }
+        TextButton(onClick = state::deleteSelected) {
+            Text("Delete", color = MaterialTheme.colorScheme.error)
+        }
+    }
+}
+
+@Composable
+private fun SearchResults(state: AppState) {
+    if (state.query.isBlank()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text(
+                "Type a name. Search covers every folder and every provider.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 32.dp),
+            )
+        }
+        return
+    }
+    if (state.searchResults.isEmpty()) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text(
+                if (state.searching) "Searching…" else "Nothing matches \"${state.query}\".",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        return
+    }
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 96.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        items(state.searchResults, key = { it.id }) { hit ->
+            ListItem(
+                headlineContent = { Text(hit.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                supportingContent = {
+                    Text(
+                        "${hit.providerName ?: "—"} · ${fmtBytes(hit.size)} · ${fmtDate(hit.createdAt)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                },
+                leadingContent = { StatusDot(ok = true) },
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                modifier = Modifier.clickable {
+                    state.closeSearch()
+                    state.open(hit)
+                },
+            )
         }
     }
 }
@@ -207,8 +366,10 @@ private fun EmptyFolder(state: AppState, onPick: () -> Unit) {
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun FileGrid(state: AppState) {
-    val folders = state.items.filter { it.isFolder }
-    val files = state.items.filterNot { it.isFolder }
+    val arranged = arrange(state.items, state.sort)
+    val folders = arranged.filter { it.isFolder }
+    val files = arranged.filterNot { it.isFolder }
+    val selecting = state.selection.isNotEmpty()
 
     LazyVerticalGrid(
         columns = GridCells.Fixed(3),
@@ -222,8 +383,11 @@ private fun FileGrid(state: AppState) {
             items(folders, key = { it.id }) { folder ->
                 FolderRow(
                     entry = folder,
-                    onClick = { state.open(folder) },
-                    onLongClick = { state.confirmDelete = folder },
+                    selected = folder.id in state.selection,
+                    onClick = {
+                        if (selecting) state.toggleSelection(folder.id) else state.open(folder)
+                    },
+                    onLongClick = { state.toggleSelection(folder.id) },
                 )
             }
         }
@@ -232,8 +396,11 @@ private fun FileGrid(state: AppState) {
             items(files, key = { it.id }) { file ->
                 ImageTile(
                     entry = file,
-                    onClick = { state.open(file) },
-                    onLongClick = { state.confirmDelete = file },
+                    selected = file.id in state.selection,
+                    onClick = {
+                        if (selecting) state.toggleSelection(file.id) else state.open(file)
+                    },
+                    onLongClick = { state.toggleSelection(file.id) },
                 )
             }
         }
@@ -242,7 +409,59 @@ private fun FileGrid(state: AppState) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun FolderRow(entry: EntryEntity, onClick: () -> Unit, onLongClick: () -> Unit) {
+private fun FileList(state: AppState) {
+    val arranged = arrange(state.items, state.sort)
+    val selecting = state.selection.isNotEmpty()
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 96.dp),
+    ) {
+        arranged.forEach { entry ->
+            item(key = entry.id) {
+                ListItem(
+                    headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    supportingContent = {
+                        Text(
+                            if (entry.isFolder) "Folder" else
+                                "${entry.providerName ?: "—"} · ${fmtBytes(entry.size)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                    leadingContent = {
+                        Icon(
+                            if (entry.isFolder) Icons.Outlined.Folder else Icons.Outlined.Image,
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    },
+                    trailingContent = {
+                        if (entry.id in state.selection) {
+                            Icon(Icons.Filled.Check, contentDescription = "Selected", modifier = Modifier.size(18.dp))
+                        }
+                    },
+                    colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                    modifier = Modifier.combinedClickable(
+                        onClick = { if (selecting) state.toggleSelection(entry.id) else state.open(entry) },
+                        onLongClick = { state.toggleSelection(entry.id) },
+                    ),
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun FolderRow(
+    entry: EntryEntity,
+    selected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -258,6 +477,15 @@ private fun FolderRow(entry: EntryEntity, onClick: () -> Unit, onLongClick: () -
             modifier = Modifier.size(22.dp),
         )
         Spacer(Modifier.width(12.dp))
+        if (selected) {
+            Icon(
+                Icons.Filled.Check,
+                contentDescription = "Selected",
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+        }
         Text(
             text = entry.name,
             style = MaterialTheme.typography.bodyLarge,
@@ -276,16 +504,40 @@ private fun FolderRow(entry: EntryEntity, onClick: () -> Unit, onLongClick: () -
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ImageTile(entry: EntryEntity, onClick: () -> Unit, onLongClick: () -> Unit) {
-    AsyncImage(
-        model = entry.thumbPath?.let(::File),
-        contentDescription = entry.name,
-        contentScale = ContentScale.Crop,
-        modifier = Modifier
+private fun ImageTile(
+    entry: EntryEntity,
+    selected: Boolean,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+) {
+    Box(
+        Modifier
             .aspectRatio(1f)
             .clip(MaterialTheme.shapes.medium)
             .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+            .then(
+                if (selected) Modifier.border(3.dp, MaterialTheme.colorScheme.primary, MaterialTheme.shapes.medium)
+                else Modifier,
+            )
             .combinedClickable(onClick = onClick, onLongClick = onLongClick),
-    )
+    ) {
+        AsyncImage(
+            model = entry.thumbPath?.let(::File),
+            contentDescription = entry.name,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize(),
+        )
+        if (selected) {
+            Icon(
+                Icons.Filled.Check,
+                contentDescription = "Selected",
+                tint = Color.White,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(4.dp)
+                    .size(18.dp),
+            )
+        }
+    }
 }
 
