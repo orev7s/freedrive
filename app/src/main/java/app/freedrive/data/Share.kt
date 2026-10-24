@@ -44,6 +44,12 @@ enum class ShareKind {
 
     /** This phone, over the Wi-Fi both devices are already on. */
     LAN,
+
+    /** A copy pushed to an anonymous host because the provider had no link API. */
+    TEMP,
+
+    /** A copy pushed to another provider of yours that does have one. */
+    MIRROR,
 }
 
 /**

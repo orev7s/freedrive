@@ -5,12 +5,14 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import app.freedrive.data.AdapterKind
 import app.freedrive.data.Catalog
 import app.freedrive.data.FreeDriveRepo
 import app.freedrive.data.LanLink
 import app.freedrive.data.Lifetime
 import app.freedrive.data.ProviderSpec
 import app.freedrive.data.ShareLink
+import app.freedrive.data.TempHost
 import app.freedrive.data.adapters.readable
 import app.freedrive.data.db.EntryEntity
 import app.freedrive.data.db.ProviderEntity
@@ -376,12 +378,67 @@ class AppState(
         }
     }
 
+    // ------------------------------------------------------------ when the provider cannot link
+
+    /** True for pCloud and the S3 family; false for Telegram and plain WebDAV. */
+    val shareProviderCanLink: Boolean
+        get() {
+            val provider = shareFor?.providerId
+                ?.let { id -> providers.firstOrNull { it.id == id } }
+                ?: return true
+            val kind = specOf(provider)?.kind ?: return true
+            return kind == AdapterKind.PCLOUD || kind == AdapterKind.S3
+        }
+
+    /** Other providers of yours that can actually mint a link, for a mirror to land on. */
+    val shareTargets: List<ProviderEntity>
+        get() = providers.filter { p ->
+            p.id != shareFor?.providerId &&
+                p.status == "OK" &&
+                (specOf(p)?.kind == AdapterKind.PCLOUD || specOf(p)?.kind == AdapterKind.S3)
+        }
+
+    /**
+     * Copies the file to an anonymous host. Slow — the bytes are read back from the provider and
+     * sent again — and the result is on somebody else's server, which is why the retention is
+     * printed before the tap as well as after it.
+     */
+    fun shareToTemp(host: TempHost) {
+        val entry = shareFor ?: return
+        if (shareBusy) return
+        scope.launch {
+            shareBusy = true
+            shareLink = null
+            shareError = null
+            runCatching { repo.shareViaTemp(entry.id, host) }
+                .onSuccess { shareLink = it }
+                .onFailure { shareError = it.readable() }
+            shareBusy = false
+        }
+    }
+
+    /** Copies the file to a provider that can link, then links from there. */
+    fun shareToMirror(target: ProviderEntity) {
+        val entry = shareFor ?: return
+        if (shareBusy) return
+        val lifetime = shareLifetime.ms
+        val seconds = if (lifetime > 0L) lifetime / 1000L else Lifetime.MAX_LINK_SECONDS
+        scope.launch {
+            shareBusy = true
+            shareLink = null
+            shareError = null
+            runCatching { repo.shareViaMirror(entry.id, target.id, seconds) }
+                .onSuccess { shareLink = it }
+                .onFailure { shareError = it.readable() }
+            shareBusy = false
+        }
+    }
+
     /**
      * The peer-to-peer path. No relay, no server of anybody's — this phone answers on the
      * local network for as long as the sheet is open.
      */
-    fun sendOverWifi() {
-        val entry = shareFor ?: return
+    fun sendOverWifi() {        val entry = shareFor ?: return
         if (shareBusy) return
         scope.launch {
             shareBusy = true

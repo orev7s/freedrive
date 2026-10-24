@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import app.freedrive.data.Lifetime
 import app.freedrive.data.ShareKind
 import app.freedrive.data.ShareLink
+import app.freedrive.data.TempHost
 import app.freedrive.data.db.EntryEntity
 import kotlinx.coroutines.delay
 
@@ -112,12 +113,16 @@ fun ShareSheet(state: AppState, entry: EntryEntity, onDismiss: () -> Unit) {
 
             val link = state.shareLink
             if (link == null) {
-                Button(
-                    onClick = state::createLink,
-                    enabled = !state.shareBusy,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(if (state.shareBusy) "Working…" else "Create link")
+                if (state.shareProviderCanLink) {
+                    Button(
+                        onClick = state::createLink,
+                        enabled = !state.shareBusy,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(if (state.shareBusy) "Working…" else "Create link")
+                    }
+                } else {
+                    NoLinkBlock(state, entry)
                 }
             } else {
                 LinkBlock(
@@ -153,6 +158,79 @@ fun ShareSheet(state: AppState, entry: EntryEntity, onDismiss: () -> Unit) {
     }
 }
 
+/**
+ * What to do when the file's provider has no share API. Two honest routes, both of which move
+ * the bytes somewhere else first, plus the cost of each stated before the tap.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun NoLinkBlock(state: AppState, entry: EntryEntity) {
+    Column {
+        Text(
+            text = "${entry.providerName ?: "This provider"} stores the file but has no share API, " +
+                "so it cannot hand out a URL. The file has to go somewhere that can.",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+
+        SectionLabel("Mirror to one of your providers")
+
+        if (state.shareTargets.isEmpty()) {
+            Text(
+                text = "None of your other providers can mint a link yet. Add pCloud, Koofr or an " +
+                    "S3 bucket (B2, e2, R2, Oracle) and this becomes a one-tap copy.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                state.shareTargets.forEach { target ->
+                    FilterChip(
+                        selected = false,
+                        enabled = !state.shareBusy,
+                        onClick = { state.shareToMirror(target) },
+                        label = { Text(target.label) },
+                    )
+                }
+            }
+            Text(
+                text = "A copy is uploaded there and served by that provider. It is deleted when " +
+                    "the link expires, so nothing is left behind.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 2.dp),
+            )
+        }
+
+        SectionLabel("Or leave it on a temporary host")
+
+        Text(
+            text = "Free anonymous upload sites. They delete files on their own schedule: we " +
+                "cannot control that, extend it, or get the file back afterwards.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TempHost.entries.forEach { host ->
+                FilterChip(
+                    selected = false,
+                    enabled = !state.shareBusy,
+                    onClick = { state.shareToTemp(host) },
+                    label = { Text("${host.label} · ${host.keeps}") },
+                )
+            }
+        }
+
+        Text(
+            text = "Anyone holding the link can download it until the host deletes it. Uploading " +
+                "means handing the file to a stranger's server — that is the trade.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 2.dp),
+        )
+    }
+}
+
 @Composable
 private fun LinkBlock(
     link: ShareLink,
@@ -165,7 +243,17 @@ private fun LinkBlock(
             value = link.url,
             onValueChange = {},
             readOnly = true,
-            label = { Text(if (link.kind == ShareKind.NATIVE) "pCloud link" else "Signed link") },
+            label = {
+                Text(
+                    when (link.kind) {
+                        ShareKind.NATIVE -> "Provider link"
+                        ShareKind.SIGNED -> "Signed link"
+                        ShareKind.TEMP -> "Temporary host link"
+                        ShareKind.MIRROR -> "Mirrored link"
+                        ShareKind.LAN -> "Link"
+                    },
+                )
+            },
             textStyle = MaterialTheme.typography.bodySmall,
             modifier = Modifier.fillMaxWidth(),
         )

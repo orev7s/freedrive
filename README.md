@@ -85,6 +85,22 @@ Three routes, and the app picks the best one the file's provider allows:
   same network and stops when the sheet closes. Useful for a big file when neither provider nor a
   server should be involved.
 
+Two providers cannot mint links at all — Telegram (bot files are not addressable) and plain WebDAV
+(no share API). For those the sheet offers two fallbacks instead of a dead end:
+
+- **Mirror** — copy the file to one of your other providers that can link (pCloud, Koofr, or any
+  S3 bucket), link from there, and give the copy the link's deadline so it is swept away with it.
+- **Temporary host** — hand the bytes to a free anonymous upload site and use its URL:
+
+  | Host | Keeps the file | Max size |
+  |---|---|---|
+  | Litterbox | 3 days | 1 GB |
+  | tmpfiles.org | 1 hour | 100 MB |
+  | uguu.se | 3 hours | 128 MB |
+
+  These are other people's servers running on donations. The retention shown is what the site
+  publishes, and the app says plainly that it cannot extend, protect or recover anything sent there.
+
 The expiry you pick in the share sheet applies to the link *and* to the stored file, so there is no
 state where a live URL points at something already deleted.
 

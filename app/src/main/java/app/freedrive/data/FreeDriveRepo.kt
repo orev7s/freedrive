@@ -524,6 +524,116 @@ class FreeDriveRepo(private val context: Context, db: FreeDriveDb) {
     }
 
     /**
+     * Fallback one: hand the bytes to an anonymous host and use the URL it gives back.
+     *
+     * Only reached when the provider that holds the file cannot mint a link. The retention is
+     * the host's own published number, [TempHost.keepsMs], and the note says out loud that this
+     * app has no say over what happens after the upload.
+     */
+    suspend fun shareViaTemp(entryId: String, host: TempHost): ShareLink = withContext(Dispatchers.IO) {
+        val entry = dao.entry(entryId) ?: throw AdapterException("That file is no longer indexed")
+        if (entry.isFolder) throw AdapterException("A folder cannot be uploaded anywhere. Open it and share an image.")
+        val provider = entry.providerId?.let { dao.provider(it) }
+            ?: throw AdapterException("That provider was removed")
+        val spec = Catalog.byId(provider.specId) ?: throw AdapterException("Unknown provider")
+        val remoteKey = entry.remoteKey ?: throw AdapterException("No remote key recorded for this file")
+
+        val bytes = Adapters.build(spec, Json.decode(provider.configJson), Json.decode(provider.secretJson))
+            .get(remoteKey)
+        val url = TempHost.upload(host, bytes, entry.name, entry.mime ?: "image/jpeg")
+
+        ShareLink(
+            url = url,
+            kind = ShareKind.TEMP,
+            diesAt = System.currentTimeMillis() + host.keepsMs,
+            note = "${host.label} says it deletes this after ${host.keeps}. " +
+                "That is their number, not ours — the file is theirs now and we cannot extend it, " +
+                "recover it, or stop them changing the rule.",
+        )
+    }
+
+    /**
+     * Fallback two: copy the bytes to another provider of yours that *can* make a link.
+     *
+     * The copy is a real file, so it is indexed — that is what makes it deletable. It carries
+     * the link's deadline, so the sweeper removes it when the link dies instead of leaving a
+     * duplicate nobody remembers creating.
+     */
+    suspend fun shareViaMirror(
+        entryId: String,
+        targetProviderId: String,
+        windowSeconds: Long,
+    ): ShareLink = withContext(Dispatchers.IO) {
+        val entry = dao.entry(entryId) ?: throw AdapterException("That file is no longer indexed")
+        if (entry.isFolder) throw AdapterException("A folder cannot be mirrored. Open it and share an image.")
+        val source = entry.providerId?.let { dao.provider(it) }
+            ?: throw AdapterException("That provider was removed")
+        val sourceSpec = Catalog.byId(source.specId) ?: throw AdapterException("Unknown provider")
+        val target = dao.provider(targetProviderId) ?: throw AdapterException("That provider was removed")
+        val targetSpec = Catalog.byId(target.specId) ?: throw AdapterException("Unknown provider")
+
+        if (target.id == source.id) throw AdapterException("That is the provider the file is already on.")
+        if (target.status != "OK") throw AdapterException("${target.label} is not verified. Check it first.")
+        if (targetSpec.kind != AdapterKind.PCLOUD && targetSpec.kind != AdapterKind.S3) {
+            throw AdapterException("${target.label} cannot mint links either — pick pCloud, Koofr or an S3 bucket.")
+        }
+
+        val remoteKey = entry.remoteKey ?: throw AdapterException("No remote key recorded for this file")
+        val mime = entry.mime ?: "image/jpeg"
+        val seconds = windowSeconds.coerceIn(1L, Lifetime.MAX_LINK_SECONDS)
+        val now = System.currentTimeMillis()
+
+        val bytes = Adapters.build(sourceSpec, Json.decode(source.configJson), Json.decode(source.secretJson))
+            .get(remoteKey)
+        val targetAdapter = Adapters.build(targetSpec, Json.decode(target.configJson), Json.decode(target.secretJson))
+        val newKey = targetAdapter.put(entry.name, bytes, mime)
+        dao.addUsed(target.id, bytes.size.toLong())
+
+        val diesAt = now + seconds * 1000L
+        dao.upsertEntry(
+            EntryEntity(
+                id = newId(),
+                parentId = entry.parentId,
+                name = entry.name,
+                isFolder = false,
+                size = bytes.size.toLong(),
+                mime = mime,
+                width = entry.width,
+                height = entry.height,
+                providerId = target.id,
+                providerName = target.label,
+                remoteKey = newKey,
+                // The original's thumbnail stays with the original; the copy starts without one.
+                thumbPath = null,
+                sha256 = entry.sha256,
+                createdAt = now,
+                expiresAt = diesAt,
+            ),
+        )
+
+        val link = when (targetAdapter) {
+            is PCloudAdapter -> ShareLink(
+                url = targetAdapter.shareUrl(newKey, diesAt / 1000L, entry.name),
+                kind = ShareKind.MIRROR,
+                diesAt = diesAt,
+                note = "A copy now lives on ${target.label} and pCloud serves it itself, so this " +
+                    "phone can be off. The copy is deleted when the link expires.",
+            )
+
+            is S3Adapter -> ShareLink(
+                url = targetAdapter.shareUrl(newKey, seconds, entry.name),
+                kind = ShareKind.MIRROR,
+                diesAt = diesAt,
+                note = "A copy now lives on ${target.label}. The link is signed for one object " +
+                    "for this window, and the copy is deleted when it ends.",
+            )
+
+            else -> throw AdapterException("${target.label} cannot mint links.")
+        }
+        link
+    }
+
+    /**
      * Starts a one-file HTTP server on the local network and hands back the address to send.
      *
      * Reachable only with the switch in Settings turned on. Binds an ephemeral port, guards the
